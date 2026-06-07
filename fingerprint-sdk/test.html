@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>NEXUS Fingerprint Test</title>
+  <script src="nexus-fingerprint.js"></script>
+</head>
+<body>
+  <h2>NEXUS Device Fingerprint Test</h2>
+
+  <form id="test-form">
+    <input type="text" name="full_name" placeholder="Full Name"><br><br>
+    <input type="text" name="phone" placeholder="Phone Number"><br><br>
+    <input type="email" name="email" placeholder="Email"><br><br>
+    <button type="button" onclick="runTest()">Collect Fingerprint</button>
+  </form>
+
+  <pre id="output" style="background:#1a1a1a;color:#00ff00;padding:20px;margin-top:20px"></pre>
+
+  <script>
+    // Start tracking when page loads
+    NexusFingerprint.startBehaviorTracking("test-form");
+
+    async function runTest() {
+      const result = await NexusFingerprint.collect();
+      document.getElementById("output").textContent =
+        JSON.stringify(result, null, 2);
+    }
+  </script>
+</body>
+</html>
