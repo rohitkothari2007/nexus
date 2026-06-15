@@ -1,7 +1,9 @@
 # ============================================================
 # NEXUS - Main API Server
-# Phase 1 - Identity Analysis Endpoints
-# Phase 2 - Device & Behavioral Intelligence
+# Complete fraud intelligence platform
+# Phase 1: Identity Intelligence
+# Phase 2: Device & Behavioral Intelligence
+# Phase 3: Factory Fingerprinting + TrustScore
 # ============================================================
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
@@ -9,9 +11,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from agents.document_analyzer import DocumentAnalyzer
 from agents.face_analyzer import FaceAnalyzer
 from agents.device_analyzer import DeviceAnalyzer
+from agents.factory_analyzer import FactoryAnalyzer
+from orchestrator import TrustScoreOrchestrator
 from db import get_db, create_tables
 from sqlalchemy.orm import Session
+from typing import Optional
 import uvicorn
+import uuid
 
 # ============================================================
 # Initialize the app
@@ -20,10 +26,9 @@ import uvicorn
 app = FastAPI(
     title="NEXUS Fraud Intelligence API",
     description="Autonomous fraud detection for financial institutions",
-    version="0.2.0"
+    version="0.3.0"
 )
 
-# Allow frontend to talk to this API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,12 +36,14 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-# Initialize analyzers once when server starts
+# Initialize all modules once on startup
 document_analyzer = DocumentAnalyzer()
 face_analyzer = FaceAnalyzer()
 device_analyzer = DeviceAnalyzer()
+factory_analyzer = FactoryAnalyzer()
+orchestrator = TrustScoreOrchestrator()
 
-# Create database tables on startup
+# Create database tables
 create_tables()
 
 
@@ -48,109 +55,59 @@ create_tables()
 def root():
     return {
         "system": "NEXUS Fraud Intelligence Platform",
-        "version": "0.2.0",
+        "version": "0.3.0",
         "status": "online",
         "modules": {
             "document_analyzer": "active",
             "face_analyzer": "active",
-            "device_analyzer": "active"
+            "device_analyzer": "active",
+            "factory_analyzer": "active",
+            "trust_score_orchestrator": "active"
+        },
+        "endpoints": {
+            "full_analysis": "/analyze/full",
+            "document_only": "/analyze/document",
+            "face_only": "/analyze/face",
+            "device_only": "/analyze/device",
+            "factory_clusters": "/factory/clusters"
         }
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy"}
+    return {
+        "status": "healthy",
+        "accounts_indexed": factory_analyzer.index.ntotal,
+        "factory_clusters": len(factory_analyzer.factory_clusters)
+    }
 
 
 # ============================================================
-# Module 1 - Document Forgery Detection
+# MAIN ENDPOINT - Full Analysis
+# Runs all 4 modules + TrustScore in one call
+# This is the primary endpoint for account onboarding
 # ============================================================
 
-@app.post("/analyze/document")
-async def analyze_document(file: UploadFile = File(...)):
-    """
-    Accepts an ID document image.
-    Returns forgery score, risk level, and detailed analysis.
-    Signals: ELA + Noise Inconsistency + Edge Sharpness + Metadata
-    """
-    allowed_types = ["image/jpeg", "image/jpg", "image/png"]
-    if file.content_type not in allowed_types:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid file type: {file.content_type}. Only JPEG and PNG allowed."
-        )
-
-    image_bytes = await file.read()
-    if len(image_bytes) > 10 * 1024 * 1024:
-        raise HTTPException(
-            status_code=400,
-            detail="File too large. Maximum size is 10MB."
-        )
-
-    try:
-        result = document_analyzer.analyze(image_bytes)
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Analysis failed: {str(e)}"
-        )
-
-    result["filename"] = file.filename
-    return result
-
-
-# ============================================================
-# Module 2 - Deepfake Face Detection
-# ============================================================
-
-@app.post("/analyze/face")
-async def analyze_face(file: UploadFile = File(...)):
-    """
-    Accepts a face or selfie image.
-    Returns deepfake score, risk level, and signal breakdown.
-    Signals: Deepfake-trained neural net + Frequency analysis + Facial geometry
-    """
-    allowed_types = ["image/jpeg", "image/jpg", "image/png"]
-    if file.content_type not in allowed_types:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid file type. Only JPEG and PNG allowed."
-        )
-
-    image_bytes = await file.read()
-    if len(image_bytes) > 10 * 1024 * 1024:
-        raise HTTPException(
-            status_code=400,
-            detail="File too large. Maximum 10MB."
-        )
-
-    try:
-        result = face_analyzer.analyze(image_bytes)
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Analysis failed: {str(e)}"
-        )
-
-    result["filename"] = file.filename
-    return result
-
-
-# ============================================================
-# Module 3 - Combined Identity Analysis (Document + Face)
-# ============================================================
-
-@app.post("/analyze/identity")
-async def analyze_identity(
+@app.post("/analyze/full")
+async def analyze_full(
     document: UploadFile = File(...),
-    face: UploadFile = File(...)
+    face: UploadFile = File(...),
+    account_id: Optional[str] = None,
+    db: Session = Depends(get_db)
 ):
     """
-    Accepts both an ID document AND a face image together.
-    Returns a combined identity risk score.
-    This is the main endpoint used during account onboarding.
+    THE MAIN NEXUS ENDPOINT.
+    Accepts ID document + selfie.
+    Runs all 4 analysis modules.
+    Returns complete TrustScore with full explanation.
+    This is what banks integrate into their onboarding flow.
     """
+
+    # Generate account ID if not provided
+    if not account_id:
+        account_id = f"ACC-{str(uuid.uuid4())[:8].upper()}"
+
     allowed_types = ["image/jpeg", "image/jpg", "image/png"]
 
     if document.content_type not in allowed_types:
@@ -161,35 +118,56 @@ async def analyze_identity(
     document_bytes = await document.read()
     face_bytes = await face.read()
 
+    # Run all modules
     try:
+        # Layer 1 - Document analysis
         doc_result = document_analyzer.analyze(document_bytes)
+
+        # Layer 2 - Face analysis
         face_result = face_analyzer.analyze(face_bytes)
+
+        # Layer 3 - Factory fingerprinting
+        # Uses document + face results as input
+        factory_result = factory_analyzer.analyze(
+            account_id=account_id,
+            doc_result=doc_result,
+            face_result=face_result,
+            device_result=None
+        )
+
+        # Layer 4 - TrustScore
+        trust_result = orchestrator.calculate(
+            account_id=account_id,
+            doc_result=doc_result,
+            face_result=face_result,
+            device_result=None,
+            factory_result=factory_result
+        )
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
-
-    doc_score = doc_result["forgery_score"]
-    face_score = face_result["deepfake_score"]
-
-    combined_identity_score = round(
-        (doc_score * 0.50) + (face_score * 0.50), 4
-    )
-
-    if combined_identity_score < 0.25:
-        risk_level = "LOW"
-        verdict = "Identity appears genuine"
-    elif combined_identity_score < 0.45:
-        risk_level = "MEDIUM"
-        verdict = "Identity shows anomalies - manual review recommended"
-    else:
-        risk_level = "HIGH"
-        verdict = "Identity shows strong signs of fraud"
+        raise HTTPException(
+            status_code=500,
+            detail=f"Analysis failed: {str(e)}"
+        )
 
     return {
-        "identity_risk_score": combined_identity_score,
-        "risk_level": risk_level,
-        "verdict": verdict,
-        "document_analysis": doc_result,
-        "face_analysis": face_result,
+        "account_id": account_id,
+        "trust_score": trust_result["trust_score"],
+        "risk_level": trust_result["risk_level"],
+        "action": trust_result["action"],
+        "explanation": trust_result["explanation"],
+        "signal_breakdown": trust_result["signal_breakdown"],
+        "factory": {
+            "factory_id": factory_result["factory_id"],
+            "factory_alert": factory_result["factory_alert"],
+            "cluster_size": factory_result["cluster_size"],
+            "total_clusters": factory_result["total_factory_clusters"]
+        },
+        "detailed_results": {
+            "document": doc_result,
+            "face": face_result,
+            "factory": factory_result
+        },
         "files": {
             "document": document.filename,
             "face": face.filename
@@ -198,8 +176,48 @@ async def analyze_identity(
 
 
 # ============================================================
-# Module 4 - Device & Behavioral Intelligence
+# Individual module endpoints
 # ============================================================
+
+@app.post("/analyze/document")
+async def analyze_document(file: UploadFile = File(...)):
+    """Analyze ID document for forgery"""
+    allowed_types = ["image/jpeg", "image/jpg", "image/png"]
+    if file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="Invalid file type.")
+
+    image_bytes = await file.read()
+    if len(image_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large.")
+
+    try:
+        result = document_analyzer.analyze(image_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+    result["filename"] = file.filename
+    return result
+
+
+@app.post("/analyze/face")
+async def analyze_face(file: UploadFile = File(...)):
+    """Analyze face/selfie for deepfake"""
+    allowed_types = ["image/jpeg", "image/jpg", "image/png"]
+    if file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="Invalid file type.")
+
+    image_bytes = await file.read()
+    if len(image_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large.")
+
+    try:
+        result = face_analyzer.analyze(image_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+    result["filename"] = file.filename
+    return result
+
 
 @app.post("/analyze/device")
 async def analyze_device(
@@ -207,19 +225,53 @@ async def analyze_device(
     account_id: str = "anonymous",
     db: Session = Depends(get_db)
 ):
-    """
-    Accepts device fingerprint from the JS SDK.
-    Stores in database and returns risk assessment.
-    Detects emulators, bots, and shared devices.
-    """
+    """Analyze device fingerprint from JS SDK"""
     try:
         result = device_analyzer.analyze(fingerprint, account_id, db)
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Device analysis failed: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Device analysis failed: {str(e)}")
     return result
+
+
+# ============================================================
+# Factory Intelligence endpoints
+# ============================================================
+
+@app.get("/factory/clusters")
+def get_factory_clusters():
+    """
+    Returns all detected factory clusters.
+    Shows the fraud ecosystem map.
+    """
+    return factory_analyzer.get_all_clusters()
+
+
+@app.get("/factory/stats")
+def get_factory_stats():
+    """
+    Returns factory detection statistics.
+    """
+    clusters = factory_analyzer.factory_clusters
+    total_accounts_in_clusters = sum(
+        c["size"] for c in clusters.values()
+    )
+
+    return {
+        "total_clusters": len(clusters),
+        "total_accounts_indexed": factory_analyzer.index.ntotal,
+        "total_accounts_in_clusters": total_accounts_in_clusters,
+        "largest_cluster": max(
+            (c["size"] for c in clusters.values()), default=0
+        ),
+        "clusters": [
+            {
+                "factory_id": c["factory_id"],
+                "size": c["size"],
+                "created_at": c["created_at"]
+            }
+            for c in clusters.values()
+        ]
+    }
 
 
 # ============================================================
